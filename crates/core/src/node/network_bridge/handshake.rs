@@ -246,10 +246,11 @@ impl HandshakeHandler {
                 outbound_conn = self.ongoing_outbound_connections.next(), if !self.ongoing_outbound_connections.is_empty() => {
                     let r = match outbound_conn {
                         Some(Ok(InternalEvent::OutboundConnEstablished(peer_id, connection))) => {
-                            tracing::debug!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
+                            tracing::info!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
                             Ok(Event::OutboundConnectionSuccessful { peer_id, connection })
                         }
                         Some(Ok(InternalEvent::OutboundGwConnEstablished(id, connection))) => {
+                            tracing::info!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound gateway connection successful");
                             if let Some(addr) = connection.my_address() {
                                 tracing::debug!(%addr, "Attempting setting own peer key");
                                 self.connection_manager.try_set_peer_key(addr);

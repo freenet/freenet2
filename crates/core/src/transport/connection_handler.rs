@@ -126,7 +126,7 @@ impl OutboundConnectionHandler {
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (outbound_sender, outbound_recv) = mpsc::channel(1);
+        let (outbound_sender, outbound_recv) = mpsc::channel(10000);
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket.clone(),
@@ -242,7 +242,7 @@ task_local! {
 }
 
 #[cfg(not(test))]
-pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
+pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
 #[cfg(test)]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
@@ -553,8 +553,12 @@ impl<S: Socket> UdpPacketsListener<S> {
         TraverseNatFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
+        tracing::debug!(
+            %remote_addr,
+            "Starting NAT traversal"
+        );
         // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(200);
+        const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
         const TIMEOUT_MULTIPLIER: f64 = 1.2;
         #[cfg(not(test))]
         const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
@@ -808,6 +812,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                 // We have retried for a while, so return an error
                 if timeout >= MAX_TIMEOUT {
+                    tracing::error!(%this_addr, %remote_addr, "failed to establish connection after multiple attempts, max timeout reached");
                     break;
                 }
 
