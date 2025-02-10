@@ -56,7 +56,10 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         let current_time = self.time_source.now();
 
         match self.time_by_packet_id.entry(packet_id) {
-            std::collections::hash_map::Entry::Occupied(_) => ReportResult::AlreadyReceived,
+            std::collections::hash_map::Entry::Occupied(_) => {
+                tracing::trace!(%packet_id, "packet already received");
+                ReportResult::AlreadyReceived
+            }
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(current_time);
                 self.packet_id_time.push_back((packet_id, current_time));
@@ -85,6 +88,8 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
     /// It removes entries that are older than `RETAIN_TIME`.
     fn cleanup(&mut self) {
         let remove_before = self.time_source.now() - RETAIN_TIME;
+        let initial_count = self.packet_id_time.len();
+
         while self
             .packet_id_time
             .front()
@@ -95,8 +100,15 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
                 self.time_by_packet_id.remove(&packet_id);
             }
         }
-        // Note: We deliberately don't clean up the pending_receipts list because it will
-        // be emptied every time get_receipts is called.
+
+        let removed_count = initial_count - self.packet_id_time.len();
+        if removed_count > 0 {
+            tracing::debug!(
+                removed_count,
+                remaining_count = self.packet_id_time.len(),
+                "cleaned up old packets"
+            );
+        }
     }
 }
 

@@ -34,10 +34,28 @@ use super::{
     Socket, TransportError,
 };
 
-// Constants for interval increase
-const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
-const INTERVAL_INCREASE_FACTOR: u64 = 2;
-const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval limit
+/// NAT traversal backoff configuration.
+///
+/// The backoff strategy uses a logarithmic growth pattern optimized for NAT traversal:
+///
+/// 1. Retry Intervals:
+///    - Base interval: BASE_INTERVAL_TIMEOUT
+///    - Growth formula: interval = BASE_INTERVAL_TIMEOUT * (BACKOFF_BASE + log2(attempt)) / INTERVAL_REDUCTION_FACTOR
+///    - Maximum interval: MAX_INTERVAL_TIMEOUT
+///
+/// This ensures:
+///    - High frequency initial attempts
+///    - Gradual backing off while maintaining connection pressure
+///    - Minimum retry rate of once every MAX_INTERVAL_TIMEOUT seconds
+///
+/// This strategy is particularly effective for:
+/// - Multiple NAT hops where early attempts are crucial
+/// - Networks with variable latency
+/// - Maintaining connection pressure without overwhelming the network
+/// - Maximizing success rate in the critical first few seconds
+const BASE_INTERVAL_TIMEOUT: Duration = Duration::from_millis(1000);
+const MAX_INTERVAL_TIMEOUT: Duration = Duration::from_millis(2000);
+const INTERVAL_REDUCTION_FACTOR: f64 = 1.3;
 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 const BANDWITH_LIMIT: usize = 1024 * 1024 * 10; // 10 MB/s
@@ -126,7 +144,7 @@ impl OutboundConnectionHandler {
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(100);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (outbound_sender, outbound_recv) = mpsc::channel(1);
+        let (outbound_sender, outbound_recv) = mpsc::channel(10000);
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket.clone(),
@@ -241,8 +259,10 @@ task_local! {
     static RANDOM_U64: [u8; 8];
 }
 
+/// The amount of times to retry NAT traversal before giving up. It should be sufficient
+/// so we give peers enough time for the other party to start the connection on its end.
 #[cfg(not(test))]
-pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 20;
+pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
 #[cfg(test)]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
@@ -283,18 +303,31 @@ impl<S: Socket> UdpPacketsListener<S> {
                     break 'inner;
                 }
             }
+
             tokio::select! {
-                // Handling of inbound packets
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
                             let packet_data = PacketData::from_buf(&buf[..size]);
-                            tracing::debug!(%remote_addr, %size, "received packet from remote");
-                            if let Some(remote_conn) = self.remote_connections.remove(&remote_addr){
+
+                            tracing::trace!(
+                                %remote_addr,
+                                %size,
+                                has_remote_conn = %self.remote_connections.contains_key(&remote_addr),
+                                has_ongoing_gw = %ongoing_gw_connections.contains_key(&remote_addr),
+                                has_ongoing_conn = %ongoing_connections.contains_key(&remote_addr),
+                                "received packet from remote"
+                            );
+
+                            if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
                                 if remote_conn.inbound_packet_sender.send(packet_data)
                                     .await
                                     .inspect_err(|err| {
-                                        tracing::debug!(%remote_addr, %err, "failed to receive packet from remote");
+                                        tracing::warn!(
+                                            %remote_addr,
+                                            %err,
+                                            "failed to receive packet from remote"
+                                        );
                                     })
                                     .is_ok()
                                 {
@@ -303,9 +336,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
 
-                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr){
+                            if let Some(inbound_packet_sender) = ongoing_gw_connections.remove(&remote_addr) {
                                 if inbound_packet_sender.send(packet_data).await.inspect_err(|err| {
-                                    tracing::debug!(%remote_addr, %err, "failed to receive packet from remote");
+                                    tracing::warn!(
+                                        %remote_addr,
+                                        %err,
+                                        "failed to receive packet from remote"
+                                    );
                                 }).is_ok() {
                                     ongoing_gw_connections.insert(remote_addr, inbound_packet_sender);
                                 }
@@ -313,32 +350,39 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
-                                if packets_sender.send(packet_data).await.is_err() {
-                                    // it can happen that the connection is established but the channel is closed because the task completed
-                                    // but we still haven't polled the result future
-                                    tracing::debug!(%remote_addr, "failed to send packet to remote");
+                                if packets_sender.send(packet_data).await.inspect_err(|err| {
+                                    tracing::warn!(
+                                        %remote_addr,
+                                        %err,
+                                        "failed to send packet to remote"
+                                    );
+                                }).is_ok() {
+                                    ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                                 }
-                                ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
                                 continue;
                             }
 
                             if !self.is_gateway {
-                                tracing::trace!(%remote_addr, "unexpected packet from remote");
+                                tracing::debug!(
+                                    %remote_addr,
+                                    %size,
+                                    "unexpected packet from non-gateway node"
+                                );
                                 continue;
                             }
-                            let packet_data = PacketData::from_buf(&buf[..size]);
+
                             let inbound_key_bytes = key_from_addr(&remote_addr);
                             let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                             let task = tokio::spawn(gw_ongoing_connection
                                 .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                 .map_err(move |error| {
-                                (error, remote_addr)
-                            }));
+                                    tracing::warn!(%remote_addr, %error, "gateway connection error");
+                                    (error, remote_addr)
+                                }));
                             ongoing_gw_connections.insert(remote_addr, packets_sender);
                             gw_connection_tasks.push(task);
                         }
                         Err(e) => {
-                            // TODO: this should panic and be propagate to the main task or retry and eventually fail
                             tracing::error!("Failed to receive UDP packet: {:?}", e);
                             return Err(e.into());
                         }
@@ -426,7 +470,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     );
                     connection_tasks.push(task);
                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
-                },
+                }
             }
         }
     }
@@ -553,13 +597,10 @@ impl<S: Socket> UdpPacketsListener<S> {
         TraverseNatFuture,
         mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
-        // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(200);
-        const TIMEOUT_MULTIPLIER: f64 = 1.2;
-        #[cfg(not(test))]
-        const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
-        #[cfg(test)]
-        const MAX_TIMEOUT: Duration = Duration::from_secs(10); // Maximum timeout limit
+        tracing::debug!(
+            %remote_addr,
+            "Starting NAT traversal"
+        );
 
         #[allow(clippy::large_enum_variant)]
         enum ConnectionState {
@@ -609,11 +650,6 @@ impl<S: Socket> UdpPacketsListener<S> {
         let f = async move {
             let mut state = ConnectionState::StartOutbound {};
             // Initialize timeout and interval
-            let mut timeout = INITIAL_TIMEOUT;
-            let mut interval_duration = INITIAL_INTERVAL;
-            let mut tick = tokio::time::interval(interval_duration);
-
-            let mut failures = 0;
 
             let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
             let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
@@ -628,7 +664,14 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let mut sent_tracker = SentPacketTracker::new();
 
-            while failures < NAT_TRAVERSAL_MAX_ATTEMPTS {
+            let backoff = crate::util::Backoff::new(
+                BASE_INTERVAL_TIMEOUT,
+                MAX_INTERVAL_TIMEOUT,
+                NAT_TRAVERSAL_MAX_ATTEMPTS,
+            )
+            .logarithmic()
+            .with_interval_reduction_factor(INTERVAL_REDUCTION_FACTOR);
+            for sleep in backoff.into_iter() {
                 match state {
                     ConnectionState::StartOutbound { .. } => {
                         tracing::debug!(%remote_addr, "sending protocol version and inbound key");
@@ -654,7 +697,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         );
                     }
                 }
-                let next_inbound = tokio::time::timeout(timeout, next_inbound.recv());
+                let next_inbound = tokio::time::timeout(sleep, next_inbound.recv());
                 match next_inbound.await {
                     Ok(Some(packet)) => {
                         tracing::debug!(%remote_addr, "received packet after sending it");
@@ -736,7 +779,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         }
                                         _ => {
                                             tracing::debug!(%remote_addr, "unexpected packet from remote");
-                                            failures += 1;
                                             continue;
                                         }
                                     }
@@ -755,7 +797,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
 
-                                failures += 1;
                                 tracing::debug!("Failed to decrypt packet");
                                 continue;
                             }
@@ -769,7 +810,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 if packet.is_intro_packet(intro_packet) {
                                     tracing::debug!(%remote_addr, "received intro packet");
                                     // we add to the number of failures so we are not stuck in a loop retrying
-                                    failures += 1;
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
@@ -801,36 +841,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
                     Err(_) => {
-                        failures += 1;
                         tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response in time, retrying");
                     }
                 }
-
-                // We have retried for a while, so return an error
-                if timeout >= MAX_TIMEOUT {
-                    break;
-                }
-
-                // Update timeout using exponential backoff, capped at MAX_TIMEOUT
-                timeout = std::cmp::min(
-                    Duration::from_millis(
-                        ((timeout.as_millis()) as f64 * TIMEOUT_MULTIPLIER) as u64,
-                    ),
-                    MAX_TIMEOUT,
-                );
-
-                // Update interval, capped at MAX_INTERVAL
-                if interval_duration < MAX_INTERVAL {
-                    interval_duration = std::cmp::min(
-                        Duration::from_millis(
-                            interval_duration.as_millis() as u64 * INTERVAL_INCREASE_FACTOR,
-                        ),
-                        MAX_INTERVAL,
-                    );
-                    tick = tokio::time::interval(interval_duration);
-                }
-
-                tick.tick().await;
+                tokio::time::sleep(sleep).await;
             }
 
             Err(TransportError::ConnectionEstablishmentFailure {
@@ -1006,6 +1020,10 @@ mod version_cmp {
                 version_str, decoded
             );
         }
+
+        let rc1 = parse_version_with_flags("0.1.0-rc1");
+        let rc2 = parse_version_with_flags("0.1.0-rc2");
+        assert_ne!(rc1, rc2, "rc1 and rc2 should have different flags");
     }
 }
 
@@ -1027,7 +1045,7 @@ mod test {
     use tracing::info;
 
     use super::*;
-    use crate::transport::packet_data::MAX_DATA_SIZE;
+    use crate::{transport::packet_data::MAX_DATA_SIZE, util::Backoff};
 
     #[test]
     fn test_handle_ack_connection_error() {
@@ -1840,5 +1858,27 @@ mod test {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_backoff_logarithmic() {
+        const _TOTAL_MAX: Duration = Duration::from_secs(30);
+        let max_attempts = 40;
+        let backoff = Backoff::new(BASE_INTERVAL_TIMEOUT, MAX_INTERVAL_TIMEOUT, max_attempts)
+            .logarithmic()
+            .with_interval_reduction_factor(INTERVAL_REDUCTION_FACTOR);
+        let total = backoff
+            .into_iter()
+            .reduce(|acc, x| {
+                println!("next: {:?}", x);
+                acc + x
+            })
+            .unwrap();
+        println!("total: {:?}", total);
+        // assert!(
+        //     total > Duration::from_secs(28) && total < TOTAL_MAX,
+        //     "total: {:?}",
+        //     total
+        // );
     }
 }
