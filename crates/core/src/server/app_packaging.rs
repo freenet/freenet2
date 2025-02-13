@@ -3,6 +3,7 @@ use std::{
     io::{Cursor, Read},
     path::Path,
 };
+use tracing::{debug, instrument};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tar::{Archive, Builder};
@@ -25,10 +26,12 @@ pub struct WebApp {
 }
 
 impl WebApp {
+    #[instrument(level = "debug", skip(web))]
     pub fn from_data(
         metadata: Vec<u8>,
         web: Builder<Cursor<Vec<u8>>>,
     ) -> Result<Self, WebContractError> {
+        debug!("Creating WebApp from metadata ({} bytes)", metadata.len());
         let buf = web.into_inner().unwrap().into_inner();
         let mut encoder = XzEncoder::new(Cursor::new(buf), 6);
         let mut compressed = vec![];
@@ -36,6 +39,19 @@ impl WebApp {
         Ok(Self {
             metadata,
             web: compressed,
+        })
+    }
+
+    #[instrument(level = "debug")]
+    pub fn from_compressed(
+        metadata: Vec<u8>,
+        compressed_web: Vec<u8>,
+    ) -> Result<Self, WebContractError> {
+        debug!("Creating WebApp from metadata ({} bytes) and pre-compressed web content ({} bytes)", 
+            metadata.len(), compressed_web.len());
+        Ok(Self {
+            metadata,
+            web: compressed_web,
         })
     }
 
@@ -50,7 +66,9 @@ impl WebApp {
         Ok(output)
     }
 
+    #[instrument(level = "debug", skip(self, dst))]
     pub fn unpack(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
+        debug!("Unpacking web content to {:?}", dst.as_ref());
         let mut decoded_web = self.decode_web();
         decoded_web
             .unpack(dst)
@@ -58,7 +76,9 @@ impl WebApp {
         Ok(())
     }
 
+    #[instrument(level = "debug", skip(self))]
     pub fn get_file(&mut self, path: &str) -> Result<Vec<u8>, WebContractError> {
+        debug!("Retrieving file from web content: {}", path);
         let mut decoded_web = self.decode_web();
         for e in decoded_web
             .entries()
@@ -80,6 +100,7 @@ impl WebApp {
     }
 
     fn decode_web(&self) -> Archive<XzDecoder<&[u8]>> {
+        debug!("Decoding compressed web content ({} bytes)", self.web.len());
         let decoder = XzDecoder::new(self.web.as_slice());
         Archive::new(decoder)
     }
@@ -89,6 +110,7 @@ impl<'a> TryFrom<&'a [u8]> for WebApp {
     type Error = WebContractError;
 
     fn try_from(state: &'a [u8]) -> Result<Self, Self::Error> {
+        debug!("Attempting to create WebApp from {} bytes of state", state.len());
         const MAX_METADATA_SIZE: u64 = 1024;
         const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;
         // Decompose the state and extract the compressed web interface
